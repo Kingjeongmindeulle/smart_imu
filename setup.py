@@ -25,6 +25,10 @@ setup(
     entry_points={
         'console_scripts': [
             'accelation_ro_pi = smart_imu.accelation_ro_pi:main',
+            'angular_accelation_ya_ro_pi = smart_imu.angular_accelation_ya_ro_pi:main',
+            'imu_pub = smart_imu.imu_pub:main',
+            'magnetic_field_ya = smart_imu.magnetic_field_ya:main',
+            'pos_vel = smart_imu.pos_vel:main',
         ],
     },
 )
