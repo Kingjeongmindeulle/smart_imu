@@ -1,132 +1,176 @@
 import rclpy
 from rclpy.node import Node
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import json
 from sensor_msgs.msg import Imu
-from geometry_msgs.msg import Vector3
-import numpy as np
-from transforms3d.quaternions import quat2mat 
-# from tf_transformations import quaternion_matrix -> ros1의 tf 패키지에 포함?
-# pip install transforms3d
+from sensor_msgs.msg import MagneticField #자기장 데이터 메시지 별도로 설정
+from threading import Thread
+import time
 
-class IMUGravityProcessor(Node):
+class HTTPHandler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        """ 안드로이드에서 전송된 HTTP POST 요청을 처리 """
+        content_length = int(self.headers['Content-Length'])
+        post_data = self.rfile.read(content_length)
+
+        try:
+            # JSON 데이터 파싱
+            data = json.loads(post_data.decode('utf-8'))
+        
+            # JSON 데이터가 딕셔너리라면 내부에서 리스트 찾기
+            if isinstance(data, dict):
+                key_with_list = next((key for key in data if isinstance(data[key], list)), None)
+                if key_with_list:
+                    '''
+                    print(f"🔍 Found key containing list: {key_with_list}")
+                    '''
+                    data = data[key_with_list]  # 내부 리스트로 변환
+                else:
+                    print("⚠️ Warning: No list found in JSON data")
+                    self.send_response(400)
+                    self.end_headers()
+                    self.wfile.write(b'{"status": "error", "message": "No list found in JSON data"}')
+                    return
+
+            # 데이터가 리스트 형태인지 확인
+            if isinstance(data, list):
+                # 센서 데이터 추출
+                accel_data, gyro_data, mag_data = self.extract_sensor_data(data)
+                self.server.ros_node.publish_imu(accel_data, gyro_data)
+                self.server.ros_node.publish_magnetic_field(mag_data) # 자기장 별도 퍼블리시
+
+            else:
+                print("⚠️ Warning: Data is not a list")
+                self.send_response(400)
+                self.end_headers()
+                self.wfile.write(b'{"status": "error", "message": "Data is not a list"}')
+                return
+
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b'{"status": "success"}')
+        except json.JSONDecodeError as e:
+            print(f"⚠️ Error: Invalid JSON format - {e}")
+            self.send_response(400)
+            self.end_headers()
+            self.wfile.write(b'{"status": "error", "message": "Invalid JSON format"}')
+        except Exception as e:
+            print(f"⚠️ Error processing JSON: {e}")
+            self.send_response(400)
+            self.end_headers()
+            self.wfile.write(b'{"status": "error"}')
+
+    def inspect_json_structure(self, data):
+        """ JSON 데이터의 최상위 키 확인 및 구조 출력 """
+        if isinstance(data, dict):
+            print("📌 JSON 최상위 키:", list(data.keys()))
+        elif isinstance(data, list):
+            print("📌 JSON 최상위 구조가 리스트입니다.")
+
+    def extract_sensor_data(self, sensor_list):
+        """ JSON 데이터에서 가속도계와 자이로스코프 데이터를 추출하는 함수 """
+        accel_data = {"x": 0.0, "y": 0.0, "z": 0.0}
+        gyro_data = {"x": 0.0, "y": 0.0, "z": 0.0}
+        mag_data = {"x": 0.0, "y": 0.0, "z": 0.0}
+
+        if isinstance(sensor_list, list):
+            for sensor in sensor_list:
+                if isinstance(sensor, dict):
+                    sensor_name = sensor.get("name", "").lower()  # 소문자 변환
+                    sensor_values = sensor.get("values", {})
+
+                    if not isinstance(sensor_values, dict):
+                        print(f"⚠️ Warning: sensor_values is not a dictionary: {sensor_values}")
+                        continue
+
+                    if "totalacceleration" in sensor_name:
+                        accel_data["x"] = sensor_values.get("x", 0.0)
+                        accel_data["y"] = sensor_values.get("y", 0.0)
+                        accel_data["z"] = sensor_values.get("z", 0.0)
+
+                    elif "gyroscope" in sensor_name:
+                        gyro_data["x"] = sensor_values.get("x", 0.0)
+                        gyro_data["y"] = sensor_values.get("y", 0.0)
+                        gyro_data["z"] = sensor_values.get("z", 0.0)
+
+                    elif "magnetometer" in sensor_name:
+                        mag_data["x"] = sensor_values.get("x", 0.0)
+                        mag_data["y"] = sensor_values.get("y", 0.0)
+                        mag_data["z"] = sensor_values.get("z", 0.0)
+            '''
+            print(f"[DEBUG] Extracted Acceleration Data: {accel_data}")
+            print(f"[DEBUG] Extracted Gyroscope Data: {gyro_data}")
+            print(f"[DEBUG] Extracted Gyroscope Data: {mag_data}")
+            '''
+        return accel_data, gyro_data, mag_data
+
+class HTTPtoROS(Node):
     def __init__(self):
-        super().__init__('imu_gravity_processor')
+        super().__init__('http_sensor_publisher')
+        self.publisher = self.create_publisher(Imu, '/android/imu', 10)
+        self.mag_publisher = self.create_publisher(MagneticField, '/android/magnetic_field', 10)
+        self.get_logger().info("IMU & Magnetic Field Publisher Node has started!")
 
-        # ✅ 기존 IMU 데이터 구독
-        self.imu_sub = self.create_subscription(
-            Imu, '/android/imu', self.imu_callback, 10)
+    def publish_imu(self, accel_data, gyro_data):
+        imu_msg = Imu()
 
-        # ✅ 기존 중력 가속도 유지하는 토픽 발행
-        self.gravity_pub = self.create_publisher(
-            Vector3, '/imu/with_gravity', 10)
+        # ROS2 메시지가 정상적으로 처리되도록 시간 정보 추가
+        imu_msg.header.stamp = self.get_clock().now().to_msg()
+        imu_msg.header.frame_id = "imu_link"
 
-        # ✅ 비중력 가속도 (중력 제거 후) 발행
-        self.non_gravity_pub = self.create_publisher(
-            Vector3, '/imu/non_gravity_acceleration', 10)
-        
-        # ✅ 속도 발행 (비중력 가속도 적분)
-        self.velocity_pub = self.create_publisher(Vector3, '/imu/velocity', 10)
+        try:
+            imu_msg.linear_acceleration.x = float(accel_data.get('x', 0.0))
+            imu_msg.linear_acceleration.y = float(accel_data.get('y', 0.0))
+            imu_msg.linear_acceleration.z = float(accel_data.get('z', 0.0))
 
-        # ✅ 상대 위치 발행 (속도 적분)
-        self.position_pub = self.create_publisher(Vector3, '/imu/position', 10)
+            imu_msg.angular_velocity.x = float(gyro_data.get('x', 0.0))
+            imu_msg.angular_velocity.y = float(gyro_data.get('y', 0.0))
+            imu_msg.angular_velocity.z = float(gyro_data.get('z', 0.0))
 
-        # ✅ 초기값 설정
-        self.prev_time = None
-        self.velocity = np.array([0.0, 0.0, 0.0])  # 속도 초기화
-        self.position = np.array([0.0, 0.0, 0.0])  # 위치 초기화
-
-        self.get_logger().info("IMU Gravity Processor Node Started!")
-
-    def imu_callback(self, msg):
-        """ IMU 데이터를 받아 비중력 계산 + 속도, 위치 """
-
-        current_time = self.get_clock().now().nanoseconds / 1e9  # 초 단위 변환
-
-        # 첫 데이터 수신 시 시간 초기화
-        if self.prev_time is None:
-            self.prev_time = current_time
+        except Exception as e:
+            self.get_logger().error(f"Error processing IMU data: {e}")
             return
-        
-        # ✅ dt (시간 변화량) 계산
-        dt = current_time - self.prev_time
-        self.prev_time = current_time
 
-        # ✅ dt 값 보정 (비정상적으로 크거나 0 이하일 경우)
-        if dt <= 0 or dt > 0.1:
-            self.get_logger().warn(f"⚠️ 비정상적인 dt 감지: {dt:.3f}s → 기본값 0.02s로 보정")
-            dt = 0.02  # 50Hz 기준 (현재 100Hz)
-
-        # ✅ 측정된 가속도 데이터 가져오기
-        measured_accel = np.array([msg.linear_acceleration.x,
-                                   msg.linear_acceleration.y,
-                                   msg.linear_acceleration.z])
-
-        # ✅ 쿼터니언을 회전 행렬로 변환 (수정함)
-        quaternion = np.array([msg.orientation.w,  
-                               msg.orientation.x,
-                               msg.orientation.y,
-                               msg.orientation.z]) # transforms3d는 (w, x, y, z) 순서 사용
-        rotation_matrix = quat2mat(quaternion) # 3x3 회전 행렬 생성
+        self.publisher.publish(imu_msg)
 
 
-        # ✅ 중력 벡터 변환 (센서 기준으로 변환)
-        gravity_earth_frame = np.array([0, 0, 9.81])  # ENU 기준 (필요하면 -9.81로 변경)
-        gravity_in_sensor_frame = rotation_matrix @ gravity_earth_frame # 변환 행렬 적용하여 중력 벡터를 센서 좌표계로 변환
 
-        # ✅ 비중력 가속도 계산
-        non_gravity_accel = measured_accel - gravity_in_sensor_frame
+    def publish_magnetic_field(self, mag_data):
+        mag_msg = MagneticField()
 
-        # ✅ 속도 계산 (비중력 가속도를 적분)
-        self.velocity += non_gravity_accel * dt
+        mag_msg.header.stamp = self.get_clock().now().to_msg()
+        mag_msg.header.frame_id = "imu_link"
 
-        # ✅ 위치 계산 (속도를 적분)
-        self.position += self.velocity * dt
+        mag_msg.magnetic_field.x = float(mag_data.get('x', 0.0))
+        mag_msg.magnetic_field.y = float(mag_data.get('y', 0.0))
+        mag_msg.magnetic_field.z = float(mag_data.get('z', 0.0))
 
-        # ✅ 중력 가속도 유지 발행
-        gravity_msg = Vector3()
-        gravity_msg.x = float(gravity_in_sensor_frame[0])
-        gravity_msg.y = float(gravity_in_sensor_frame[1])
-        gravity_msg.z = float(gravity_in_sensor_frame[2])
-        self.gravity_pub.publish(gravity_msg)
+        self.mag_publisher.publish(mag_msg)
 
-        # ✅ 비중력 가속도 발행
-        non_grav_msg = Vector3()
-        non_grav_msg.x = float(non_gravity_accel[0])
-        non_grav_msg.y = float(non_gravity_accel[1])
-        non_grav_msg.z = float(non_gravity_accel[2])
-        self.non_gravity_pub.publish(non_grav_msg)
 
-        # ✅ 속도 발행
-        velocity_msg = Vector3()
-        velocity_msg.x = float(self.velocity[0])
-        velocity_msg.y = float(self.velocity[1])
-        velocity_msg.z = float(self.velocity[2])
-        self.velocity_pub.publish(velocity_msg)
 
-        # ✅ 위치 발행
-        position_msg = Vector3()
-        position_msg.x = float(self.position[0])
-        position_msg.y = float(self.position[1])
-        position_msg.z = float(self.position[2])
-        self.position_pub.publish(position_msg)
+def start_http_server(ros_node, host='0.0.0.0', port=5000):
+    """ HTTP 서버 실행 함수 (멀티스레드 실행) """
+    server = HTTPServer((host, port), HTTPHandler)
+    server.ros_node = ros_node  # ROS 노드 전달
+    print(f"HTTP Server running on {host}:{port}")
 
-        # ✅ 8. 디버깅 로그 추가 (센서 방향 확인)
-        self.get_logger().info(f"""
-🌍 Original Acceleration (with gravity): x={measured_accel[0]:.3f}, y={measured_accel[1]:.3f}, z={measured_accel[2]:.3f}
-🌍 Rotation Matrix:
-{rotation_matrix}
-🌍 Transformed Gravity (sensor frame): x={gravity_msg.x:.3f}, y={gravity_msg.y:.3f}, z={gravity_msg.z:.3f}
-🌍 Non-Gravity Acceleration: x={non_grav_msg.x:.3f}, y={non_grav_msg.y:.3f}, z={non_grav_msg.z:.3f}
-🌍 Velocity: x={velocity_msg.x:.3f}, y={velocity_msg.y:.3f}, z={velocity_msg.z:.3f}
-🌍 Position: x={position_msg.x:.3f}, y={position_msg.y:.3f}, z={position_msg.z:.3f}
-🕒 Time Step: {dt:.3f}s
-        """)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("HTTP Server shutting down...")
+        server.shutdown()
 
 def main():
     rclpy.init()
-    node = IMUGravityProcessor()
-    rclpy.spin(node)
-    node.destroy_node()
-    rclpy.shutdown()
+    ros_node = HTTPtoROS()
+
+    # HTTP 서버를 별도 스레드에서 실행
+    server_thread = Thread(target=start_http_server, args=(ros_node,))
+    server_thread.daemon = True
+    server_thread.start()
+
+    rclpy.spin(ros_node)
 
 if __name__ == '__main__':
     main()
