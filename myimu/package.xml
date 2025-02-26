@@ -1,0 +1,27 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>myimu</name>
+  <version>0.0.1</version>
+  <description>Custom IMU message package in C++</description>
+  <maintainer email="you@todo.todo">Your Name</maintainer>
+  <license>Apache-2.0</license>
+
+  <!-- 빌드도구: ament_cmake -->
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <!-- C++ 노드에서 사용 가능하도록 -->
+  <depend>rclcpp</depend>
+  <depend>std_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>builtin_interfaces</depend>
+
+  <!-- 메시지 빌드 의존성 -->
+  <build_depend>rosidl_default_generators</build_depend>
+  <!-- 메시지 런타임 의존성 -->
+  <exec_depend>rosidl_default_runtime</exec_depend>
+  <member_of_group>rosidl_interface_packages</member_of_group>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
